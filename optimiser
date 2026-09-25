@@ -1,0 +1,212 @@
+import sys, json, time
+import numpy as np
+import orlab, jpype
+
+JAR = "OpenRocket-24.12.jar"
+RAIL_LEN = 2.0
+TARGET_LAND_LO, TARGET_LAND_HI = 6.0, 8.0
+MIN_SM = 1.5
+MIN_RAIL_V = 20.0
+
+NOSE_SHAPES = ["OGIVE", "ELLIPSOID", "CONICAL", "POWER"]
+
+BOUNDS = dict(
+    nose_L    = (0.10, 0.30),
+    nose_k    = (0.0, 1.0),
+    body_L    = (0.45, 0.90),
+    cr        = (0.08, 0.25),
+    ct        = (0.00, 0.15),
+    fin_h     = (0.05, 0.18),
+    sweep     = (0.00, 0.20),
+    fin_t     = (0.002, 0.005),
+    chute_D   = (0.40, 1.00),
+    avio_mass = (0.15, 0.35),
+    avio_pos  = (0.02, 0.25),
+    chute_mass= (0.05, 0.12),
+)
+KEYS = list(BOUNDS.keys())
+
+
+def pack(d):
+    return np.array([d[k] for k in KEYS], dtype=float)
+
+def unpack(x):
+    return {k: float(v) for k, v in zip(KEYS, x)}
+
+def bounds_array():
+    return np.array([BOUNDS[k] for k in KEYS]).T
+
+
+def walk(c):
+    yield c
+    for ch in c.getChildren():
+        yield from walk(ch)
+
+def parts(rocket):
+    d = {}
+    for c in walk(rocket):
+        d.setdefault(str(c.getClass().getSimpleName()), c)
+    return d
+
+
+def apply_params(rocket, p, nose_shape, fin_type):
+    P = parts(rocket)
+    nose, body = P["NoseCone"], P["BodyTube"]
+    fin = P.get("TrapezoidFinSet") if fin_type == "TRAPEZOID" else P.get("EllipticalFinSet")
+    chute = P.get("Parachute")
+    mass_comp = P.get("MassComponent")
+
+    ShapeEnum = jpype.JClass("info.openrocket.core.rocketcomponent.Transition$Shape")
+    nose.setShapeType(getattr(ShapeEnum, nose_shape))
+    nose.setLength(p["nose_L"])
+    if nose_shape in ("OGIVE", "POWER"):
+        nose.setShapeParameter(p["nose_k"])
+    body.setLength(p["body_L"])
+
+    fin.setThickness(p["fin_t"])
+    if fin_type == "TRAPEZOID":
+        fin.setRootChord(p["cr"]); fin.setTipChord(p["ct"])
+        fin.setHeight(p["fin_h"]); fin.setSweep(p["sweep"])
+    else:
+        fin.setLength(p["cr"])
+        fin.setHeight(p["fin_h"])
+
+    if chute is not None:
+        chute.setDiameter(p["chute_D"])
+        chute.setMassOverridden(True)
+        chute.setOverrideMass(p["chute_mass"])
+
+    if mass_comp is not None:
+        AxialEnum = jpype.JClass("info.openrocket.core.rocketcomponent.position.AxialMethod")
+        mass_comp.setComponentMass(p["avio_mass"])
+        mass_comp.setAxialMethod(AxialEnum.TOP)
+        mass_comp.setAxialOffset(p["avio_pos"])
+
+
+def evaluate_raw(orl, ork_path, p, nose_shape, fin_type):
+    doc = orl.load_doc(ork_path)
+    rocket = doc.getRocket()
+    apply_params(rocket, p, nose_shape, fin_type)
+
+    sim = doc.getSimulation(0)
+    orl.run_simulation(sim)
+
+    T = orlab.FlightDataType
+    d = orl.get_timeseries(sim, [T.TYPE_TIME, T.TYPE_ALTITUDE,
+                                 T.TYPE_VELOCITY_TOTAL, T.TYPE_STABILITY])
+    t, h, v, sm = (np.asarray(d[k]) for k in
+                   [T.TYPE_TIME, T.TYPE_ALTITUDE, T.TYPE_VELOCITY_TOTAL, T.TYPE_STABILITY])
+
+    i_apo = int(np.argmax(h))
+    i_rail = int(np.argmax(h > RAIL_LEN))
+    sm_min = float(np.nanmin(sm[:i_apo + 1]))
+    sm_launch = float(sm[0])
+    v_land = float(abs(v[-1]))
+
+    return dict(apogee=float(h.max()), sm_min=sm_min, sm_launch=sm_launch,
+                v_rail=float(v[i_rail]), v_land=v_land)
+
+
+def objective(orl, ork_path, x, nose_shape, fin_type, lam=(1e5, 1e5, 1e5)):
+    p = unpack(x)
+    try:
+        r = evaluate_raw(orl, ork_path, p, nose_shape, fin_type)
+    except Exception as e:
+        print("EVAL FAILED:", repr(e))
+        return 1e9, None
+
+    pen_sm   = max(0.0, MIN_SM - r["sm_min"]) ** 2
+    pen_rail = max(0.0, MIN_RAIL_V - r["v_rail"]) ** 2
+    pen_land = (max(0.0, TARGET_LAND_LO - r["v_land"]) ** 2 +
+                max(0.0, r["v_land"] - TARGET_LAND_HI) ** 2)
+
+    J = -r["apogee"] + lam[0]*pen_sm + lam[1]*pen_rail + lam[2]*pen_land
+    return J, r
+
+
+def spsa_optimize(orl, ork_path, nose_shape, fin_type, x0, n_iter=60,
+                   a0=0.05, c0=0.02, alpha=0.602, gamma=0.101, log=None):
+    lo, hi = bounds_array()
+    span = hi - lo
+    x = np.clip(x0.copy(), lo, hi)
+    best_x, best_J, best_r = x.copy(), np.inf, None
+
+    for k in range(1, n_iter + 1):
+        a_k = a0 / (k ** alpha)
+        c_k = c0 / (k ** gamma) * span
+
+        delta = np.random.choice([-1, 1], size=len(x))
+        x_plus  = np.clip(x + c_k * delta, lo, hi)
+        x_minus = np.clip(x - c_k * delta, lo, hi)
+
+        J_plus,  _ = objective(orl, ork_path, x_plus,  nose_shape, fin_type)
+        J_minus, _ = objective(orl, ork_path, x_minus, nose_shape, fin_type)
+
+        grad = (J_plus - J_minus) / (2 * c_k * delta)
+        x = np.clip(x - a_k * grad, lo, hi)
+        J_now, r_now = objective(orl, ork_path, x, nose_shape, fin_type)
+        if J_now < best_J:
+            best_J, best_x, best_r = J_now, x.copy(), r_now
+
+        if log is not None and k % 5 == 0:
+            print(f"  [{nose_shape:9s}/{fin_type:9s}] iter {k:3d}  "
+                  f"J={J_now:10.1f}  apogee={r_now['apogee'] if r_now else float('nan'):7.1f} m  "
+                  f"SM_min={r_now['sm_min'] if r_now else float('nan'):5.2f} cal  "
+                  f"SM_launch={r_now['sm_launch'] if r_now else float('nan'):5.2f} cal  "
+                  f"v_rail={r_now['v_rail'] if r_now else float('nan'):5.1f}  "
+                  f"v_land={r_now['v_land'] if r_now else float('nan'):5.1f}")
+
+    return best_x, best_J, best_r
+
+
+def run_all(orl, jar=JAR):
+    x0 = pack(dict(nose_L=0.20, nose_k=1.0, body_L=0.60, cr=0.16, ct=0.08,
+                    fin_h=0.10, sweep=0.10, fin_t=0.003, chute_D=0.60,
+                    avio_mass=0.25, avio_pos=0.05, chute_mass=0.08))
+
+    results = []
+    combos = [(shape, "TRAPEZOID", "baseline_trap.ork") for shape in NOSE_SHAPES]
+
+    for nose_shape, fin_type, ork in combos:
+        print(f"\n=== {nose_shape} nose / {fin_type} fins ===")
+        t0 = time.time()
+        best_x, best_J, best_r = spsa_optimize(orl, ork, nose_shape, fin_type,
+                                                x0, n_iter=80, log=True)
+        dt = time.time() - t0
+        entry = dict(nose_shape=nose_shape, fin_type=fin_type,
+                     params=unpack(best_x), J=best_J, result=best_r, seconds=dt)
+        results.append(entry)
+        if best_r is not None:
+            print(f"  best: apogee={best_r['apogee']:.1f} m  "
+                  f"SM_min={best_r['sm_min']:.2f} cal  SM_launch={best_r['sm_launch']:.2f} cal  "
+                  f"v_land={best_r['v_land']:.1f} m/s  ({dt:.0f}s)")
+        else:
+            print("  best: NO FEASIBLE / NO SUCCESSFUL EVAL FOUND")
+
+    results.sort(key=lambda e: e["J"])
+    return results
+
+
+if __name__ == "__main__":
+    with orlab.OpenRocketInstance(jar_path=JAR) as inst:
+        orl = orlab.Helper(inst)
+        results = run_all(orl)
+
+    with open("optimization_results.json", "w") as f:
+        json.dump(results, f, indent=2)
+
+    print("\n\n===== RANKED RESULTS =====")
+    for e in results:
+        if e["result"] is None:
+            print(f"{'FAILED':10s} {e['nose_shape']:9s}/{e['fin_type']:10s}  (no successful evaluation)")
+            continue
+        feasible = (e["result"]["sm_min"] >= MIN_SM and
+                    e["result"]["v_rail"] >= MIN_RAIL_V and
+                    TARGET_LAND_LO <= e["result"]["v_land"] <= TARGET_LAND_HI)
+        tag = "OK" if feasible else "INFEASIBLE"
+        print(f"{tag:10s} {e['nose_shape']:9s}/{e['fin_type']:10s}  "
+              f"apogee={e['result']['apogee']:7.1f} m  SM_min={e['result']['sm_min']:.2f}  J={e['J']:.1f}")
+
+    best = results[0]
+    print("\nBest feasible design:")
+    print(json.dumps(best, indent=2))
